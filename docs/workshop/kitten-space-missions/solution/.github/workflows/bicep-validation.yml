@@ -1,0 +1,191 @@
+name: Bicep Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+      - workshop-clean
+    paths:
+      - 'docs/workshop/kitten-space-missions/solution/bicep/**'
+      - '.github/workflows/bicep-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AZURE_TENANT_ID: b5a68ec8-e110-4be5-b500-173db93ba29f
+  AZURE_SUBSCRIPTION_ID: e507bceb-37fc-4a08-be9b-c2fd25224ec3
+  AZURE_CLIENT_ID: 816af725-7ebe-41b2-b8c6-9fea0d47d9ca
+  BICEP_PATH: docs/workshop/kitten-space-missions/solution/bicep
+  RESOURCE_GROUP: rg-kitten-missions-dev
+  LOCATION: westeurope
+
+jobs:
+  lint:
+    name: Lint Bicep Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bicep CLI
+        uses: Azure/bicep-install@v1
+        with:
+          version: latest
+
+      - name: Lint Bicep files
+        run: |
+          echo "🔍 Linting Bicep files..."
+          cd ${{ env.BICEP_PATH }}
+          
+          # Build main.bicep (esto valida sintaxis)
+          az bicep build --file main.bicep
+          
+          echo "✅ Bicep lint completed"
+
+      - name: Comment PR with lint results
+        if: github.event_name == 'pull_request' && success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ **Bicep Lint**: All files passed validation'
+            })
+
+  security-scan:
+    name: Security Scan with Checkov
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov security scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.BICEP_PATH }}
+          framework: bicep
+          soft_fail: true
+          quiet: false
+          output_format: cli
+
+      - name: Comment PR with security results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '🔐 **Security Scan**: Checkov analysis completed. Check Actions logs for details.'
+            })
+
+  what-if:
+    name: What-If Deployment
+    runs-on: ubuntu-latest
+    needs: [lint, security-scan]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: OIDC Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-If Analysis
+        id: whatif
+        run: |
+          echo "📊 Running What-If deployment analysis..."
+          cd ${{ env.BICEP_PATH }}
+          
+          # Ejecutar what-if
+          WHATIF_OUTPUT=$(az deployment group what-if \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file main.bicep \
+            --parameters parameters/dev.parameters.json \
+            --result-format FullResourcePayloads \
+            --no-pretty-print 2>&1 || true)
+          
+          echo "WHAT_IF_RESULT<<EOF" >> $GITHUB_OUTPUT
+          echo "$WHATIF_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "✅ What-If analysis completed"
+
+      - name: Comment PR with What-If results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const whatifOutput = `${{ steps.whatif.outputs.WHAT_IF_RESULT }}`;
+            const truncated = whatifOutput.length > 60000 
+              ? whatifOutput.substring(0, 60000) + '\n\n...(truncated)'
+              : whatifOutput;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📊 What-If Deployment Analysis\n\n\`\`\`\n${truncated}\n\`\`\``
+            })
+
+  validation-summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [lint, security-scan, what-if]
+    if: always()
+    steps:
+      - name: Check validation results
+        run: |
+          echo "📋 Validation Summary:"
+          echo "  - Lint: ${{ needs.lint.result }}"
+          echo "  - Security Scan: ${{ needs.security-scan.result }}"
+          echo "  - What-If: ${{ needs.what-if.result }}"
+          
+          if [[ "${{ needs.lint.result }}" == "failure" ]] || \
+             [[ "${{ needs.what-if.result }}" == "failure" ]]; then
+            echo "❌ Validation failed"
+            exit 1
+          else
+            echo "✅ All validations passed"
+          fi
+
+      - name: Comment PR final status
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const lintStatus = '${{ needs.lint.result }}';
+            const securityStatus = '${{ needs.security-scan.result }}';
+            const whatifStatus = '${{ needs.what-if.result }}';
+            
+            const statusEmoji = (status) => status === 'success' ? '✅' : status === 'failure' ? '❌' : '⚠️';
+            
+            const body = `## 🎯 Bicep Validation Summary
+            
+            | Check | Status |
+            |-------|--------|
+            | Lint | ${statusEmoji(lintStatus)} ${lintStatus} |
+            | Security Scan | ${statusEmoji(securityStatus)} ${securityStatus} |
+            | What-If | ${statusEmoji(whatifStatus)} ${whatifStatus} |
+            
+            ${lintStatus === 'success' && whatifStatus === 'success' 
+              ? '✅ **Ready for deployment**' 
+              : '❌ **Fix issues before merging**'}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            })

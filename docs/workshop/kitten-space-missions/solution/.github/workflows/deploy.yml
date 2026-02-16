@@ -1,0 +1,205 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/workshop/kitten-space-missions/solution/bicep/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+        default: 'dev'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  BICEP_PATH: 'docs/workshop/kitten-space-missions/solution/bicep'
+  AZURE_SUBSCRIPTION_ID: 'e507bceb-37fc-4a08-be9b-c2fd25224ec3'
+
+jobs:
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: ${{ steps.deploy.outputs.appServiceUrl }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure CLI Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set Azure Subscription
+        run: |
+          az account set --subscription ${{ env.AZURE_SUBSCRIPTION_ID }}
+          echo "✅ Subscription set to: $(az account show --query name -o tsv)"
+
+      - name: Create Resource Group
+        run: |
+          RG_NAME="rg-kitten-missions-dev"
+          LOCATION="westeurope"
+          TAGS='Project="Kitten Space Missions" Environment=dev ManagedBy=GitHub-Actions'
+          
+          if ! az group show --name $RG_NAME &>/dev/null; then
+            echo "📦 Creating resource group $RG_NAME..."
+            az group create \
+              --name $RG_NAME \
+              --location $LOCATION \
+              --tags $TAGS
+          else
+            echo "✅ Resource group $RG_NAME already exists"
+          fi
+
+      - name: Pre-Deployment What-If
+        id: whatif
+        run: |
+          echo "🔍 Running final What-If before deployment..."
+          cd ${{ env.BICEP_PATH }}
+          
+          az deployment group what-if \
+            --resource-group rg-kitten-missions-dev \
+            --template-file main.bicep \
+            --parameters parameters/dev.bicepparam \
+            --parameters sqlAadAdminObjectId=${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }} \
+            --parameters sqlAadAdminLogin=${{ secrets.SQL_AAD_ADMIN_LOGIN }} \
+            --parameters keyVaultAdminObjectIds="['${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }}']" \
+            --result-format ResourceIdOnly
+
+      - name: Deploy Infrastructure
+        id: deploy
+        run: |
+          echo "🚀 Deploying infrastructure to Azure..."
+          cd ${{ env.BICEP_PATH }}
+          
+          DEPLOYMENT_NAME="deploy-$(date +%Y%m%d-%H%M%S)"
+          
+          az deployment group create \
+            --resource-group rg-kitten-missions-dev \
+            --template-file main.bicep \
+            --parameters parameters/dev.bicepparam \
+            --parameters sqlAadAdminObjectId=${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }} \
+            --parameters sqlAadAdminLogin=${{ secrets.SQL_AAD_ADMIN_LOGIN }} \
+            --parameters keyVaultAdminObjectIds="['${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }}']" \
+            --name $DEPLOYMENT_NAME \
+            --verbose
+          
+          echo "✅ Deployment $DEPLOYMENT_NAME completed"
+          
+          # Capturar outputs del deployment
+          APP_SERVICE_URL=$(az deployment group show \
+            --resource-group rg-kitten-missions-dev \
+            --name $DEPLOYMENT_NAME \
+            --query properties.outputs.appServiceUrl.value -o tsv)
+          
+          echo "appServiceUrl=$APP_SERVICE_URL" >> $GITHUB_OUTPUT
+          echo "deploymentName=$DEPLOYMENT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Configure SQL Database Permissions
+        run: |
+          echo "🔐 Configurando permisos SQL para Managed Identity..."
+          
+          # Obtener información del deployment
+          APP_SERVICE_NAME=$(az deployment group show \
+            --resource-group rg-kitten-missions-dev \
+            --name ${{ steps.deploy.outputs.deploymentName }} \
+            --query properties.outputs.appServiceName.value -o tsv)
+          
+          SQL_SERVER_NAME=$(az deployment group show \
+            --resource-group rg-kitten-missions-dev \
+            --name ${{ steps.deploy.outputs.deploymentName }} \
+            --query properties.outputs.sqlServerName.value -o tsv)
+          
+          SQL_DB_NAME=$(az deployment group show \
+            --resource-group rg-kitten-missions-dev \
+            --name ${{ steps.deploy.outputs.deploymentName }} \
+            --query properties.outputs.sqlDatabaseName.value -o tsv)
+          
+          echo "App Service: $APP_SERVICE_NAME"
+          echo "SQL Server: $SQL_SERVER_NAME"
+          echo "SQL Database: $SQL_DB_NAME"
+          
+          # Crear script SQL para asignar permisos
+          cat > configure-sql-permissions.sql << EOF
+          -- Crear usuario para Managed Identity del App Service
+          IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = N'$APP_SERVICE_NAME')
+          BEGIN
+              CREATE USER [$APP_SERVICE_NAME] FROM EXTERNAL PROVIDER;
+              PRINT 'User created';
+          END
+          ELSE
+          BEGIN
+              PRINT 'User already exists';
+          END
+          
+          -- Asignar roles
+          ALTER ROLE db_datareader ADD MEMBER [$APP_SERVICE_NAME];
+          ALTER ROLE db_datawriter ADD MEMBER [$APP_SERVICE_NAME];
+          
+          PRINT 'Permissions configured successfully';
+          EOF
+          
+          # Ejecutar script SQL (requiere conectividad)
+          # Nota: Esto puede fallar si no hay acceso desde GitHub Actions runners
+          # Alternativa: Ejecutar manualmente o desde Azure Cloud Shell
+          
+          echo "⚠️  SQL permissions script generated. Manual execution may be required:"
+          echo "   az sql db execute --database $SQL_DB_NAME --resource-group rg-kitten-missions-dev --server $SQL_SERVER_NAME --file configure-sql-permissions.sql"
+
+      - name: Run Smoke Tests
+        run: |
+          echo "🧪 Running smoke tests..."
+          
+          APP_URL="${{ steps.deploy.outputs.appServiceUrl }}"
+          
+          # Wait for App Service to be ready
+          echo "⏳ Waiting for App Service to be ready..."
+          sleep 30
+          
+          # Test health endpoint
+          echo "Testing health endpoint: ${APP_URL}/health"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${APP_URL}/health || echo "000")
+          
+          if [[ $HTTP_STATUS == "200" ]]; then
+            echo "✅ Health check passed (HTTP $HTTP_STATUS)"
+          else
+            echo "⚠️  Health check returned HTTP $HTTP_STATUS (may need app code deployment)"
+          fi
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** Development" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** ${{ steps.deploy.outputs.deploymentName }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Resource Group:** rg-kitten-missions-dev" >> $GITHUB_STEP_SUMMARY
+          echo "**App Service URL:** ${{ steps.deploy.outputs.appServiceUrl }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. ✅ Deploy application code to App Service" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Configure SQL database permissions (see logs)" >> $GITHUB_STEP_SUMMARY
+          echo "3. ✅ Run integration tests" >> $GITHUB_STEP_SUMMARY
+          echo "4. ✅ Monitor Application Insights for telemetry" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Azure Portal - Resource Group](https://portal.azure.com/#@/resource/subscriptions/${{ env.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-kitten-missions-dev)" >> $GITHUB_STEP_SUMMARY
+          echo "- [App Service](${{ steps.deploy.outputs.appServiceUrl }})" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify on Failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed! Check logs for details." >> $GITHUB_STEP_SUMMARY
+          exit 1

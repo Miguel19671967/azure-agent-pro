@@ -1,0 +1,231 @@
+name: Deploy to Azure Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+  push:
+    branches:
+      - main
+      - workshop-clean
+    paths:
+      - 'docs/workshop/kitten-space-missions/solution/bicep/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_TENANT_ID: b5a68ec8-e110-4be5-b500-173db93ba29f
+  AZURE_SUBSCRIPTION_ID: e507bceb-37fc-4a08-be9b-c2fd25224ec3
+  AZURE_CLIENT_ID: 816af725-7ebe-41b2-b8c6-9fea0d47d9ca
+  BICEP_PATH: docs/workshop/kitten-space-missions/solution/bicep
+  RESOURCE_GROUP: rg-kitten-missions-dev
+  LOCATION: westeurope
+
+jobs:
+  deploy:
+    name: Deploy Infrastructure to Dev
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: https://portal.azure.com/#@${{ env.AZURE_TENANT_ID }}/resource/subscriptions/${{ env.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ env.RESOURCE_GROUP }}
+    outputs:
+      app-service-name: ${{ steps.deployment.outputs.appServiceName }}
+      app-service-url: ${{ steps.deployment.outputs.appServiceUrl }}
+      sql-server-name: ${{ steps.deployment.outputs.sqlServerName }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: OIDC Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure Resource Group exists
+        run: |
+          echo "🔍 Checking Resource Group: ${{ env.RESOURCE_GROUP }}"
+          
+          if ! az group show --name ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "📦 Creating Resource Group..."
+            az group create \
+              --name ${{ env.RESOURCE_GROUP }} \
+              --location ${{ env.LOCATION }} \
+              --tags \
+                Environment=dev \
+                Project="Kitten Space Missions" \
+                ManagedBy="GitHub-Actions" \
+                Workshop="true"
+            echo "✅ Resource Group created"
+          else
+            echo "✅ Resource Group already exists"
+          fi
+
+      - name: Deploy Bicep Template
+        id: deployment
+        run: |
+          echo "🚀 Deploying infrastructure to Azure..."
+          cd ${{ env.BICEP_PATH }}
+          
+          DEPLOYMENT_NAME="deploy-$(date +%Y%m%d-%H%M%S)"
+          echo "📝 Deployment name: $DEPLOYMENT_NAME"
+          
+          # Deploy
+          DEPLOYMENT_OUTPUT=$(az deployment group create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file main.bicep \
+            --parameters parameters/dev.parameters.json \
+            --name "$DEPLOYMENT_NAME" \
+            --query properties.outputs \
+            --output json)
+          
+          echo "📊 Deployment outputs:"
+          echo "$DEPLOYMENT_OUTPUT" | jq '.'
+          
+          # Extract outputs
+          APP_SERVICE_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.appServiceName.value')
+          APP_SERVICE_URL=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.appServiceUrl.value')
+          SQL_SERVER_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.sqlServerName.value')
+          
+          echo "appServiceName=$APP_SERVICE_NAME" >> $GITHUB_OUTPUT
+          echo "appServiceUrl=$APP_SERVICE_URL" >> $GITHUB_OUTPUT
+          echo "sqlServerName=$SQL_SERVER_NAME" >> $GITHUB_OUTPUT
+          
+          echo "✅ Deployment completed successfully"
+
+      - name: Deployment Summary
+        run: |
+          echo "## 🎉 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Name |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Group | ${{ env.RESOURCE_GROUP }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Service | ${{ steps.deployment.outputs.appServiceName }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| App URL | https://${{ steps.deployment.outputs.appServiceUrl }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SQL Server | ${{ steps.deployment.outputs.sqlServerName }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Infrastructure deployed successfully!" >> $GITHUB_STEP_SUMMARY
+
+  smoke-tests:
+    name: Run Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy
+    environment: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: OIDC Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Test App Service is Running
+        run: |
+          echo "🧪 Testing App Service status..."
+          APP_STATE=$(az webapp show \
+            --name ${{ needs.deploy.outputs.app-service-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query state -o tsv)
+          
+          echo "App Service state: $APP_STATE"
+          
+          if [[ "$APP_STATE" != "Running" ]]; then
+            echo "❌ App Service is not running (state: $APP_STATE)"
+            exit 1
+          fi
+          
+          echo "✅ App Service is running"
+
+      - name: Test SQL Database is Online
+        run: |
+          echo "🧪 Testing SQL Database status..."
+          SQL_STATUS=$(az sql db show \
+            --name sqldb-kitten-missions-dev \
+            --server ${{ needs.deploy.outputs.sql-server-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query status -o tsv)
+          
+          echo "SQL Database status: $SQL_STATUS"
+          
+          if [[ "$SQL_STATUS" != "Online" ]]; then
+            echo "❌ SQL Database is not online (status: $SQL_STATUS)"
+            exit 1
+          fi
+          
+          echo "✅ SQL Database is online"
+
+      - name: Test Key Vault Access
+        run: |
+          echo "🧪 Testing Key Vault accessibility..."
+          KV_NAME=$(az keyvault list \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "[0].name" -o tsv)
+          
+          if az keyvault show --name "$KV_NAME" &>/dev/null; then
+            echo "✅ Key Vault accessible: $KV_NAME"
+          else
+            echo "❌ Key Vault not accessible"
+            exit 1
+          fi
+
+      - name: Test VNet Created
+        run: |
+          echo "🧪 Testing VNet existence..."
+          VNET_NAME=$(az network vnet list \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "[0].name" -o tsv)
+          
+          if [[ -n "$VNET_NAME" ]]; then
+            echo "✅ VNet created: $VNET_NAME"
+          else
+            echo "❌ VNet not found"
+            exit 1
+          fi
+
+      - name: Smoke Tests Summary
+        run: |
+          echo "## 🧪 Smoke Tests Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ App Service is Running" >> $GITHUB_STEP_SUMMARY
+          echo "✅ SQL Database is Online" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Key Vault is Accessible" >> $GITHUB_STEP_SUMMARY
+          echo "✅ VNet Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 All smoke tests passed!" >> $GITHUB_STEP_SUMMARY
+
+  rollback-on-failure:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy, smoke-tests]
+    if: failure()
+    steps:
+      - name: OIDC Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Rollback Warning
+        run: |
+          echo "⚠️ Deployment or smoke tests failed!"
+          echo "Consider manual rollback if needed:"
+          echo "  az group deployment list --resource-group ${{ env.RESOURCE_GROUP }} --query '[0].name' -o tsv"
+          echo "Note: In dev environment, you may want to debug instead of rollback."
+          
+          echo "## ⚠️ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Deployment or smoke tests failed. Check logs for details." >> $GITHUB_STEP_SUMMARY
+          echo "Manual intervention may be required." >> $GITHUB_STEP_SUMMARY

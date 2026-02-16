@@ -1,0 +1,201 @@
+name: Validate Bicep
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/workshop/kitten-space-missions/solution/bicep/**'
+      - '.github/workflows/validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  BICEP_PATH: 'docs/workshop/kitten-space-missions/solution/bicep'
+
+jobs:
+  lint-and-validate:
+    name: Lint and Validate Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bicep
+        uses: Azure/bicep-install@v1
+        with:
+          version: latest
+
+      - name: Bicep Build (Lint)
+        run: |
+          echo "🔍 Building Bicep files to check syntax..."
+          cd ${{ env.BICEP_PATH }}
+          az bicep build --file main.bicep
+          echo "✅ Bicep build successful"
+
+      - name: Bicep Lint
+        run: |
+          echo "🔍 Running Bicep linter..."
+          cd ${{ env.BICEP_PATH }}
+          az bicep lint --file main.bicep
+          echo "✅ Bicep linting passed"
+
+  security-scan:
+    name: Security Scan with Checkov
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov security scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.BICEP_PATH }}
+          framework: bicep
+          soft_fail: false
+          output_format: cli
+          download_external_modules: true
+
+  validate-deployment:
+    name: Validate Azure Deployment
+    runs-on: ubuntu-latest
+    needs: [lint-and-validate]
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure CLI Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create Resource Group (if not exists)
+        run: |
+          RG_NAME="rg-kitten-missions-dev"
+          LOCATION="westeurope"
+          
+          if ! az group show --name $RG_NAME &>/dev/null; then
+            echo "📦 Creating resource group $RG_NAME..."
+            az group create --name $RG_NAME --location $LOCATION
+          else
+            echo "✅ Resource group $RG_NAME already exists"
+          fi
+
+      - name: Azure Deployment Validate
+        run: |
+          echo "🔍 Validating deployment..."
+          cd ${{ env.BICEP_PATH }}
+          
+          az deployment group validate \
+            --resource-group rg-kitten-missions-dev \
+            --template-file main.bicep \
+            --parameters parameters/dev.bicepparam \
+            --parameters sqlAadAdminObjectId=${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }} \
+            --parameters sqlAadAdminLogin=${{ secrets.SQL_AAD_ADMIN_LOGIN }} \
+            --parameters keyVaultAdminObjectIds="['${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }}']"
+          
+          echo "✅ Deployment validation successful"
+
+  what-if-analysis:
+    name: What-If Analysis
+    runs-on: ubuntu-latest
+    needs: [validate-deployment]
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure CLI Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-If Deployment
+        id: whatif
+        run: |
+          echo "🔍 Running What-If analysis..."
+          cd ${{ env.BICEP_PATH }}
+          
+          WHATIF_OUTPUT=$(az deployment group what-if \
+            --resource-group rg-kitten-missions-dev \
+            --template-file main.bicep \
+            --parameters parameters/dev.bicepparam \
+            --parameters sqlAadAdminObjectId=${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }} \
+            --parameters sqlAadAdminLogin=${{ secrets.SQL_AAD_ADMIN_LOGIN }} \
+            --parameters keyVaultAdminObjectIds="['${{ secrets.SQL_AAD_ADMIN_OBJECT_ID }}']" \
+            --result-format FullResourcePayloads)
+          
+          echo "$WHATIF_OUTPUT"
+          
+          # Save to file for PR comment
+          echo "$WHATIF_OUTPUT" > whatif-output.txt
+          
+      - name: Comment PR with What-If
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            let whatIfOutput = '';
+            try {
+              whatIfOutput = fs.readFileSync('${{ env.BICEP_PATH }}/whatif-output.txt', 'utf8');
+            } catch (e) {
+              whatIfOutput = 'Could not read What-If output';
+            }
+            
+            const output = `## 🔍 Azure Deployment What-If Analysis
+            
+            <details>
+            <summary>Click to expand What-If results</summary>
+            
+            \`\`\`
+            ${whatIfOutput}
+            \`\`\`
+            
+            </details>
+            
+            ✅ **Validation Status:** Passed
+            🔐 **Security Scan:** Completed
+            📋 **Next Steps:** Review changes and merge to trigger deployment
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [lint-and-validate, security-scan, what-if-analysis]
+    if: always()
+    steps:
+      - name: Check validation results
+        run: |
+          echo "## 📋 Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Bicep Lint | ${{ needs.lint-and-validate.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| What-If Analysis | ${{ needs.what-if-analysis.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.lint-and-validate.result }}" == "success" && \
+                "${{ needs.security-scan.result }}" == "success" && \
+                "${{ needs.what-if-analysis.result }}" == "success" ]]; then
+            echo "✅ **All validations passed!** Ready to merge." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Some validations failed.** Please review and fix." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
