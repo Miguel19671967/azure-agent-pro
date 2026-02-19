@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "aiServicesName": {
+      "value": "openai-ipe-001"
+    },
+    "location": {
+      "value": "eastus2"
+    },
+    "sku": {
+      "value": "S0"
+    },
+    "publicNetworkAccess": {
+      "value": "Enabled"
+    },
+    "tags": {
+      "value": {
+        "Project": "IPE-RPA",
+        "Environment": "Production",
+        "ManagedBy": "Bicep-IaC",
+        "Client": "IP-Editorial",
+        "CostCenter": "RPA-Automation",
+        "DeployedBy": "Azure-Architect-Pro"
+      }
+    }
+  }
+}
