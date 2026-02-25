@@ -60,7 +60,7 @@ resource gpt5NanoDeployment 'Microsoft.CognitiveServices/accounts/deployments@20
   name: 'gpt-5-nano'
   sku: {
     name: 'GlobalStandard'
-    capacity: 1 // Mínimo requerido para GlobalStandard
+    capacity: 250 // Réplica exacta del origen
   }
   properties: {
     model: {
@@ -82,7 +82,7 @@ resource gpt5MiniDeployment 'Microsoft.CognitiveServices/accounts/deployments@20
   name: 'gpt-5-mini'
   sku: {
     name: 'GlobalStandard'
-    capacity: 1 // Mínimo requerido para GlobalStandard
+    capacity: 150 // Réplica exacta del origen
   }
   properties: {
     model: {
